@@ -64,6 +64,7 @@ static xemusock_socket_t  sock_client = UNCONNECTED;
 static int  umon_write_pos, umon_read_pos;
 static int  umon_echo;
 static char umon_read_buffer [0x1000];
+static int  umon_load_len, umon_load_addr;
 
 
 // WARNING: This source is pretty ugly, ie not so much check of overflow of the output (write) buffer.
@@ -137,6 +138,42 @@ static void setmem28 ( char *param, int addr )
 }
 
 
+static void load_to_address ( char *arg )
+{
+	int start_addr, end_addr;
+	arg = parse_hex_arg(arg, &start_addr, 0, 0xFFFFFFF);
+	if (!arg)
+		return;
+	arg = parse_hex_arg(arg, &end_addr, 0, 0xFFFFFFF);
+	if (!(arg && check_end_of_command(arg, 1)))
+		return;
+	umon_load_addr = start_addr;
+	umon_load_len = end_addr - start_addr;
+	if (umon_load_len < 0)
+		umon_load_len += 0x10000000;
+	umon_send_ok = 0;
+}
+
+
+static void process_load_command_data ( char *data, int len )
+{
+	len = len < umon_load_len ? len : umon_load_len;
+	int n = len;
+	while (n > 0) {
+		int max_avail = 0x10000000 - umon_load_addr;
+		int write_bytes = n < max_avail ? n : max_avail;
+		m65mon_setmem28(umon_load_addr, write_bytes, (Uint8*)data);
+		DEBUGPRINT("UARTMON: load@$%x, %d bytes" NL, umon_load_addr, write_bytes);
+		umon_load_addr += write_bytes;
+		umon_load_addr %= 0x10000000;
+		n -= write_bytes;
+	}
+	umon_load_len -= len;
+	if (umon_load_len == 0)
+		uartmon_finish_command();
+}
+
+
 static void execute_command ( char *cmd )
 {
 	int bank;
@@ -200,6 +237,9 @@ static void execute_command ( char *cmd )
 		case 's':
 			cmd = parse_hex_arg(cmd, &par1, 0, 0xFFFFFFF);
 			setmem28(cmd, par1);
+			break;
+		case 'l':
+			load_to_address(cmd);
 			break;
 		case 't':
 			if (!*cmd)
@@ -396,6 +436,8 @@ void uartmon_update ( void )
 				// Reset reading/writing information
 				umon_write_size = 0;
 				umon_read_pos = 0;
+				umon_write_pos = 0;
+				umon_load_len = 0;
 				DEBUGPRINT("UARTMON: new connection established on socket " PRINTF_SOCK NL, sock_client);
 			}
 		}
@@ -404,7 +446,7 @@ void uartmon_update ( void )
 	if (sock_client == UNCONNECTED)
 		return;
 	// If there is data to write, try to write
-	if (umon_write_size) {
+	if (umon_write_size && umon_load_len == 0) {
 		if (!umon_send_ok)
 			return;
 		ret = xemusock_send(sock_client, umon_write_buffer + umon_write_pos, umon_write_size, &xerr);
@@ -428,8 +470,8 @@ void uartmon_update ( void )
 		}
 		if (umon_write_size)
 			return;	// if we still have bytes to write, return and leave the work for the next update
+		umon_write_pos = 0;
 	}
-	umon_write_pos = 0;
 	// Try to read data
 	ret = xemusock_recv(sock_client, umon_read_buffer + umon_read_pos, sizeof(umon_read_buffer) - umon_read_pos - 1, &xerr);
 	if (ret != XS_SOCKET_ERROR || (ret == XS_SOCKET_ERROR && !xemusock_should_repeat_from_error(xerr)))
@@ -444,6 +486,11 @@ void uartmon_update ( void )
 		return;
 	}
 	if (ret > 0) {
+		// Read data into load buffer in case load command is still expecting more binary data
+		if (umon_load_len > 0) {
+			process_load_command_data(umon_read_buffer, ret);
+			return;
+		}
 		/* ECHO: provide echo for the client */
 		if (umon_echo) {
 			char*p = umon_read_buffer + umon_read_pos;
@@ -453,20 +500,29 @@ void uartmon_update ( void )
 					umon_write_buffer[umon_write_size++] = *(p++);
 				} else {
 					umon_echo = 0; // setting to zero avoids more input to echo, and also signs a complete command
+					if (*p == 13 && n > 0 && *(p + 1) == 10) {
+						n--;
+					}
 					*p = 0; // terminate string in read buffer
 					break;
 				}
+			umon_read_pos += ret - n;
 		}
 		/* ECHO: end */
-		umon_read_pos += ret;
-		umon_read_buffer[umon_read_pos] = 0;
 		//debug_buffer(umon_read_buffer);
 		if (!umon_echo || sizeof(umon_read_buffer) - umon_read_pos - 1 == 0) {
-			umon_read_buffer[sizeof(umon_read_buffer) - 1] = 0; // just in case of a "mega long command" with filled rx buffer ...
+			if (umon_echo)
+				umon_read_buffer[sizeof(umon_read_buffer) - 1] = 0; // just in case of a "mega long command" with filled rx buffer ...
 			umon_write_buffer[umon_write_size++] = '\r';
 			umon_write_buffer[umon_write_size++] = '\n';
 			umon_send_ok = 1;	// by default, command is finished after the execute_command()
 			execute_command(umon_read_buffer);	// Execute our command!
+			if (umon_load_len > 0) {
+				if (ret != umon_read_pos)
+					process_load_command_data(umon_read_buffer + umon_read_pos, ret - umon_read_pos);
+				umon_read_pos = 0;
+				return;
+			}
 			// command may delay (like with trace) the finish of the command with
 			// setting umon_send_ok to zero. In this case, some need to call
 			// uartmon_finish_command() some time otherwise the monitor connection
