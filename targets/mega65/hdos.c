@@ -24,15 +24,17 @@ Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA */
 #include "memory_mapper.h"
 #include "io_mapper.h"
 #include "sdcard.h"
+// FIXME??: xemu_safe_read() is here (and in corresponding .c) This should be moved to normal emutools.h/.c!
+#include "xemu/emutools_files.h"
 
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
 
-// This source is meant to virtualize Hyppo's DOS functions to be able to access
+// This source is meant to virtualize Hyppo's HDOS functions to be able to access
 // the host OS (what runs Xemu) filesystem via the normal HDOS calls (ie what
-// would see the sd-card otherwise).
+// you would see the sd-card otherwise).
 
 //#define DEBUGHDOS(...) DEBUG(__VA_ARGS__)
 #define DEBUGHDOS(...) DEBUGPRINT(__VA_ARGS__)
@@ -41,6 +43,7 @@ static struct {
 	Uint8 func;
 	const char *func_name;
 	int func_is_virtualized;
+	int last_func_call_was_virtualized;
 	Uint8 in_x, in_y, in_z;
 	// The following ones are ONLY used in virtualized functions originated from hdos_enter()
 	Uint8 virt_out_a, virt_out_x, virt_out_y, virt_out_z, virt_out_carry;
@@ -70,8 +73,10 @@ static struct {
 #define HDOSERR_INVALID_ADDRESS	0x10
 #define HDOSERR_FILE_NOT_FOUND	0x88
 #define HDOSERR_INVALID_DESC	0x89
+#define HDOSERR_READ_ERROR	0x20
 #define HDOSERR_IS_DIRECTORY	0x86
 #define HDOSERR_NOT_DIRECTORY	0x87
+#define HDOSERR_TOO_LONG	0x83
 #define HDOSERR_IMAGE_WRONG_LEN	0x8A
 #define HDOSERR_TOO_MANY_OPEN	0x84
 #define HDOSERR_NO_SUCH_DISK	0x80
@@ -87,7 +92,7 @@ static int copy_mem_from_user ( Uint8 *target, int max_size, const int terminato
 	if (terminator_byte >= 0)
 		max_size--;
 	for (;;) {
-		// DOS calls should not have user specified data >= $8000!
+		// HDOS calls should not have user specified data >= $8000!
 		if (source_cpu_addr >= 0x8000)
 			return -1;
 		const Uint8 byte = memory_debug_read_cpu_addr(source_cpu_addr++);
@@ -229,13 +234,13 @@ error_some:
 static const char *hdos_get_func_name ( const int func_no )
 {
 	if (XEMU_UNLIKELY((func_no & 1) || (unsigned int)func_no >= 0x80U)) {
-		FATAL("%s(%d) invalid DOS trap function number", __func__, func_no);
+		FATAL("%s(%d) invalid HDOS trap function number", __func__, func_no);
 		return "?";
 	}
-	// DOS function names are from hyppo's asm source from mega65-core repository
+	// HDOS function names are from hyppo's asm source from mega65-core repository
 	// It should be updated if there is a change there. Also maybe at other parts of
 	// this source too, to follow the ABI of the Hyppo-DOS here too.
-	static const char INVALID_SUBFUNCTION[] = "INVALID_DOS_FUNC";
+	static const char INVALID_SUBFUNCTION[] = "INVALID_HDOS_FUNC";
 	static const char *func_names[] = {
 		"getversion",					// 00
 		"getdefaultdrive",				// 02
@@ -423,6 +428,50 @@ static void hdos_virt_mount ( const int unit )
 	}
 	// it seems everything went out fine :D
 	DEBUGHDOS("HDOS: VIRT: mount of image \"%s\" on unit %d went well." NL, fullpath, unit);
+	hdos.virt_out_carry = 1;	// signal OK status
+}
+
+
+static void hdos_virt_loadfile ( const Uint32 addr_base )
+{
+	hdos.func_is_virtualized = 1;
+	Uint32 addr_ofs = hdos.in_x + (hdos.in_y << 8) + (hdos.in_z << 16);
+	const Uint32 addr_origin_report = addr_base + addr_ofs;
+	int fd;
+	char fullpath[PATH_MAX + 1];
+	struct stat st;
+	int ret = try_open(hdos.cwd, hdos.setname_fn, O_RDONLY, &st, fullpath, &fd);
+	if (ret) {
+		DEBUGHDOS("HDOS: VIRT: loadfile would fail on try_open() = %d!" NL, ret);
+		hdos.virt_out_a = ret;	// pass back the error code got from try_open()
+		return;
+	}
+	if (st.st_size > 0x1000000) {
+		DEBUGHDOS("HDOS: VIRT: loadfile got too big file: %s" NL, fullpath);
+		hdos.virt_out_a = HDOSERR_TOO_LONG;
+		return;
+	}
+	int loaded = 0;
+	for (;;) {
+		Uint8 buffer[1024];
+		ret = xemu_safe_read(fd, buffer, sizeof buffer);
+		if (ret <= 0)			// error (ret < 0) or end of file (ret == 0)
+			break;
+		loaded += ret;
+		if (loaded > st.st_size) {	// should not happen, but nice to check, anyway
+			ret = -1;
+			break;
+		}
+		for (const Uint8 *b = buffer; ret > 0; ret--, b++, addr_ofs++)
+			memory_debug_write_phys_addr(addr_base + (addr_ofs & 0xFFFFFF), *b);
+	}
+	xemu_os_close(fd);
+	if (ret < 0 || loaded != st.st_size) {
+		DEBUGHDOS("HDOS: VIRT: loadfile read() error (or file size changed?) on %s" NL, fullpath);
+		hdos.virt_out_a = HDOSERR_READ_ERROR;
+		return;
+	}
+	DEBUGHDOS("HDOS: VIRT: loadfile successfully loaded %d bytes from $%X: %s" NL, loaded, addr_origin_report, fullpath);
 	hdos.virt_out_carry = 1;	// signal OK status
 }
 
@@ -632,14 +681,18 @@ static void hdos_virt_cd ( void )
 }
 
 
-#define HDOS_VIRT_HYPPO_UNIMPLEMENTED()	hdos.func_is_virtualized = 1
-#define HDOS_VIRT_XEMU_UNIMPLEMENTED()	do { \
-						DEBUGPRINT("HDOS: VIRT: Unimplemented by Xemu!! %s ~ #$%02X)" NL, hdos.func_name, hdos.func); \
-						hdos.func_is_virtualized = 1; \
-					} while (0)
+static void _hdos_func_unimplemented ( const char *by_entity )
+{
+	DEBUGPRINT("HDOS: VIRT: unimplemented by %s: %s (#$%02X)" NL, by_entity, hdos.func_name, hdos.func);
+	hdos.func_is_virtualized = 1;	// which cause we'll handle this
+	hdos.virt_out_a = 0xFF;		// no such function error code (same as "no such trap" in hyppo's source)
+	// Note: in virtualized functions (hdos.func_is_virtualized is set to non-zero), the default is to HAVE error, so we don't need to set carry
+}
+#define HDOS_VIRT_HYPPO_UNIMPLEMENTED()	_hdos_func_unimplemented("HYPPO")
+#define HDOS_VIRT_XEMU_UNIMPLEMENTED()	_hdos_func_unimplemented("XEMU")
 
 
-// Called when DOS trap is triggered.
+// Called when HDOS trap is triggered.
 // Can be used to take control (without hyppo doing it) but setting the needed register values,
 // and calling hypervisor_leave() to avoid Hyppo to run.
 void hdos_enter ( const Uint8 func_no )
@@ -659,22 +712,26 @@ void hdos_enter ( const Uint8 func_no )
 	if (hdos.do_virt) {
 		// Can be overriden by virtualized functions.
 		// these virt_out stuffs won't be used otherwise, if a virtualized function does not set hdos.func_is_virtualized
-		hdos.virt_out_a = 0xFF;	// set to $FF by default, override in virtualized function implementations if needed
-		hdos.virt_out_x = cpu65.x;
+		//hdos.virt_out_a = 0xFF;		// set to $FF by default, override in virtualized function implementations if needed
+		hdos.virt_out_a = cpu65.a;
+		hdos.virt_out_x = cpu65.x;	// by default, out regs are the same as in regs (no change), surely can be overriden in virt functions
 		hdos.virt_out_y = cpu65.y;
 		hdos.virt_out_z = cpu65.z;
 		hdos.virt_out_carry = 0;	// assumming **ERROR** (carry flag is clear) by default! Override that to '1' in virt functions if it's OK!
 		// Let's see the virualized functions.
 		// Those should set hdos.func_is_virtualized, also the hdos.virt_out_carry is operation was OK, and probably they want to
 		// set some register values as output in hdos.virt_out_a, hdos.virt_out_x, hdos.virt_out_y and hdos.virt_out_z
-		// The reason of this complicated method: the switch-case below contains the call of virtualized DOS function implementations and
-		// they can decide to NOT set hdos.func_is_virtualized conditionally, so it's even possible to have virtualized DOS file functions
+		// The reason of this complicated method: the switch-case below contains the call of virtualized HDOS function implementations and
+		// they can decide to NOT set hdos.func_is_virtualized conditionally, so it's even possible to have virtualized HDOS file functions
 		// just for a certain directory / file names, and so on! (though it's currently not so much planned to use ...).
 		// The reason for ">> 1" everywhere: to have a continous space of switch values and allow better chance for C compiler to generate a jump-table.
 		switch (hdos.func >> 1) {
-			case 0x00 >> 1:	// get version, do NOT virtualize this!
+			case 0x00 >> 1:	// get version, do NOT virtualize this! We still want to original Hyppo/HDOS version queried.
+				break;
 			case 0x02 >> 1:	// get default drive
 			case 0x04 >> 1:	// get current drive
+				// For both cases, we support only one drive and always being the default.
+				// Thus the actual answer can be the same for both.
 				hdos.func_is_virtualized = 1;
 				hdos.virt_out_a = 0;
 				hdos.virt_out_carry = 1;
@@ -707,21 +764,36 @@ void hdos_enter ( const Uint8 func_no )
 			case 0x14 >> 1:
 				hdos_virt_readdir();
 				break;
-			case 0x16 >> 1:
-			case 0x20 >> 1:
+			case 0x16 >> 1:	// same function as $20
+				hdos_virt_close_dir_or_file();
+				break;
+			case 0x20 >> 1:	// same function as $16
 				hdos_virt_close_dir_or_file();
 				break;
 			case 0x2E >> 1:	// setname, do NOT virtualize this! (though we track/store result in hdos_leave) It's also great that we have hyppo's check on filename syntax, etc.
 				break;
+			case 0x36 >> 1:	// loadfile
+				hdos_virt_loadfile(0);
+				break;
 			case 0x38 >> 1:	// get last error code
-				hdos.func_is_virtualized = 1;
-				hdos.virt_out_a = hdos.error_code;
-				hdos.virt_out_carry = 1;
+				if (hdos.last_func_call_was_virtualized) {
+					// Trying to solve the problem, that in HDOS virtualization mode, virtualized and non-virtualized calls are mixed!
+					// Thus I try to check if the last function was virtualized and then only virtualize this get error code call.
+					// see above as well after this huge switch/case construct how to set hdos.last_func_call_was_virtualized
+					// FIXME: 1. this logic should be checked if really works.
+					// FIXME: 2. Is the error code reset after reading it?
+					hdos.func_is_virtualized = 1;
+					hdos.virt_out_a = hdos.error_code;
+					hdos.virt_out_carry = 1;
+				}
 				break;
 			case 0x3A >> 1:	// setup transfer area, do NOT virtualize this! (though we track/store result in hdos_leave)
 				break;
 			case 0x3C >> 1:
 				hdos_virt_cdroot();
+				break;
+			case 0x3E >> 1:	// loadfile_attic
+				hdos_virt_loadfile(0x8000000);	// the same as function $36, however the base address is the start of the "attic RAM" and not zero (start of fast RAM)
 				break;
 			case 0x40 >> 1:
 				hdos_virt_mount(0);
@@ -730,6 +802,8 @@ void hdos_enter ( const Uint8 func_no )
 				hdos_virt_mount(1);
 				break;
 		}
+		if (hdos.func != 0x38)	// See the comment(s) above in the switch statement, case "0x38 >> 1"
+			hdos.last_func_call_was_virtualized = hdos.func_is_virtualized;
 		if (hdos.func_is_virtualized) {
 			D6XX_registers[0x40] = hdos.virt_out_a;
 			D6XX_registers[0x41] = hdos.virt_out_x;
@@ -744,21 +818,21 @@ void hdos_enter ( const Uint8 func_no )
 				hdos.error_code = hdos.virt_out_a;	// also remember the error code for the get last error function
 			}
 			DEBUGHDOS("HDOS: VIRT: returning %s (A=$%02X) from virtualized function #$%02X bypassing Hyppo" NL, hdos.virt_out_carry ? "OK" : "ERROR", hdos.virt_out_a, hdos.func);
-			// forced leave of hypervisor mode now, bypassing hyppo to process this DOS trap function
+			// forced leave of hypervisor mode now, bypassing hyppo to process this HDOS trap function
 			hypervisor_leave();
 		} else
-			DEBUGHDOS("HDOS: VIRT: unvirtualized DOS function #$%02X pass-through to Hyppo" NL, hdos.func);
+			DEBUGHDOS("HDOS: VIRT: unvirtualized HDOS function #$%02X pass-through to Hyppo" NL, hdos.func);
 	}
 }
 
 
-// Called when DOS trap is leaving.
+// Called when HDOS trap is leaving.
 // Can be used to examine the result hyppo did with a call, or even do some modifications.
 void hdos_leave ( const Uint8 func_no )
 {
 	hdos.func = func_no;
 	hdos.func_name = hdos_get_func_name(hdos.func);
-	DEBUGHDOS("HDOS: leaving function #$%02X (%s) with carry %s (A=$%02X)" NL, hdos.func, hdos.func_name, cpu65.pf_c ? "SET" : "CLEAR", cpu65.a);
+	DEBUGHDOS("HDOS: leaving function #$%02X (%s) with carry %s (A,X,Y,Z=$%02X,$%02X,$%02X,$%02X)" NL, hdos.func, hdos.func_name, cpu65.pf_c ? "SET" : "CLEAR", cpu65.a, cpu65.x, cpu65.y, cpu65.z);
 	// if "func_is_virtualized" flag is set, we don't want to mess things up further, as it was handled before in hdos.c somewhere
 	if (hdos.func_is_virtualized) {
 		DEBUGHDOS("HDOS: VIRT: was marked as virtualized, so end of %s in %s()" NL, hdos.func_name, __func__);
@@ -796,7 +870,7 @@ void hdos_leave ( const Uint8 func_no )
 	if (hdos.func == 0x40) {	// 0x40: d81attach0 TODO: later I should check if mount was OK and name was MEGA65.D81 to have special external mount then. If HDOS virt is not enabled.
 		DEBUGPRINT("HDOS: %s(\"%s\") = %s" NL, hdos.func_name, hdos.setname_fn, cpu65.pf_c ? "OK" : "FAILED");
 		if (!strcasecmp(hdos.setname_fn, "MEGA65.D81"))
-			OSD(-1, -1, "MEGA65.D81 ;-)");
+			OSD(-1, -1, "MEGA65.D81 mounted from SD-card");
 		return;
 	}
 }
@@ -811,6 +885,7 @@ static void hdos_reset ( void )
 	hdos.func = -1;
 	hdos.error_code = 0;
 	hdos.transfer_area_addr = 0;
+	hdos.last_func_call_was_virtualized = 0;
 	hypervisor_hdos_close_descriptors();
 }
 
@@ -831,6 +906,7 @@ int hypervisor_hdos_virtualization_status ( const int set, const char **root_ptr
 		if (!!hdos.do_virt != !!set) {
 			hdos.do_virt = set;
 			DEBUGPRINT("HDOS: virtualization is now %s" NL, set ? "ENABLED" : "DISABLED");
+			hdos.last_func_call_was_virtualized = 0;	// reset this, just to be safe ...
 		}
 	}
 	if (root_ptr)
